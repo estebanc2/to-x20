@@ -112,8 +112,8 @@ static void capture_task(void *arg)
         // LOG cada 5 segundos
         int64_t elapsed = esp_timer_get_time() - t_start;
         if (elapsed >= 5000000LL) {
-            uint32_t hz = (uint32_t)((int64_t)total_frames * 1000000LL / elapsed);
-            ESP_LOGI(TAG, "Tasa ADC real: %lu Hz/canal (objetivo: 44100)", (unsigned long)hz);
+            //uint32_t hz = (uint32_t)((int64_t)total_frames * 1000000LL / elapsed);
+            //ESP_LOGI(TAG, "Tasa ADC real: %lu Hz/canal (objetivo: 44100)", (unsigned long)hz);
             total_frames = 0;
             t_start = esp_timer_get_time();
         }

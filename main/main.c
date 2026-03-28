@@ -18,10 +18,10 @@ void app_main(void)
     // 2. Bluetooth A2DP Source
     ESP_ERROR_CHECK(bt_audio_start());
     
-    /* Loop de monitoreo */
+    /* Loop de monitoreo 
     while (1) {
         ESP_LOGI(TAG, "Heap libre: %" PRIu32 " bytes",
                  esp_get_free_heap_size());
         vTaskDelay(pdMS_TO_TICKS(5000));
-    }
+    }*/
 }
