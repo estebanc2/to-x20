@@ -11,7 +11,6 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/ringbuf.h"
 #include <string.h>
 #include <math.h>
 
@@ -72,46 +71,11 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 /* ── Callback de datos: ESP-IDF pide muestras PCM ──────────── */
 static int32_t a2dp_data_cb(uint8_t *buf, int32_t len)
 {
-    if (!g_audio_ringbuf || !s_connected) {
+    if (!s_connected) {
         memset(buf, 0, len);
         return len;
     }
-
-    // len siempre es 512 bytes = 128 frames estéreo int16
-    // Drenar el ring buffer hasta tener exactamente lo que pide BT
-    // Si hay exceso, descartar — si hay déficit, silencio
-    size_t available = 0;
-    uint8_t *data = NULL;
-
-    // Intentar obtener exactamente len bytes
-    data = xRingbufferReceiveUpTo(g_audio_ringbuf, &available,
-                                   0,  // no bloquear
-                                   (size_t)len);
-
-    if (data && available > 0) {
-        memcpy(buf, data, available);
-        vRingbufferReturnItem(g_audio_ringbuf, data);
-
-        if ((int32_t)available < len)
-            memset(buf + available, 0, len - available);
-
-        // Si el ring buffer tiene demasiado acumulado, drenar el exceso
-        // para evitar latencia creciente (causa el efecto ardilla)
-        size_t excess = xRingbufferGetCurFreeSize(g_audio_ringbuf);
-        size_t total  = AUDIO_RINGBUF_SIZE;
-        size_t used   = total - excess;
-
-        if (used > (size_t)(len * 4)) {
-            // Más de 4 frames acumulados — drenar la mitad
-            size_t to_drain = used / 2;
-            size_t drained;
-            void *old = xRingbufferReceiveUpTo(g_audio_ringbuf, &drained, 0, to_drain);
-            if (old) vRingbufferReturnItem(g_audio_ringbuf, old);
-        }
-    } else {
-        memset(buf, 0, len);
-    }
-
+    audio_capture_read(buf, len);
     return len;
 }
 
