@@ -1,8 +1,6 @@
 #include "audio_capture.h"
-#include "esp_timer.h"
-#include "esp_adc/adc_oneshot.h"
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
+
+#include "esp_adc/adc_continuous.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,138 +11,131 @@ static const char *TAG = "AUDIO_CAP";
 
 RingbufHandle_t g_audio_ringbuf = NULL;
 
-static adc_oneshot_unit_handle_t s_adc_handle;
-static adc_cali_handle_t         s_cali_l, s_cali_r;
-static TaskHandle_t               s_capture_task = NULL;
-static bool                       s_running = false;
-
-/* ── Calibración ────────────────────────────────────────────── */
-static bool adc_calibration_init(adc_unit_t unit,
-                                  adc_channel_t channel,
-                                  adc_atten_t atten,
-                                  adc_cali_handle_t *out)
-{
-#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
-    adc_cali_curve_fitting_config_t cfg = {
-        .unit_id  = unit,
-        .chan     = channel,
-        .atten    = atten,
-        .bitwidth = ADC_BITWIDTH_12,
-    };
-    if (adc_cali_create_scheme_curve_fitting(&cfg, out) == ESP_OK) {
-        ESP_LOGI(TAG, "Calibración curve-fitting OK (ch%d)", channel);
-        return true;
-    }
-#endif
-#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
-    adc_cali_line_fitting_config_t cfg = {
-        .unit_id  = unit,
-        .atten    = atten,
-        .bitwidth = ADC_BITWIDTH_12,
-    };
-    if (adc_cali_create_scheme_line_fitting(&cfg, out) == ESP_OK) {
-        ESP_LOGI(TAG, "Calibración line-fitting OK (ch%d)", channel);
-        return true;
-    }
-#endif
-    ESP_LOGW(TAG, "Sin calibración para canal %d", channel);
-    return false;
-}
+static adc_continuous_handle_t s_adc_handle = NULL;
+static TaskHandle_t             s_task       = NULL;
+static bool                     s_running    = false;
 
 #ifndef CLAMP
-#define CLAMP(x, lo, hi)  ((x) < (lo) ? (lo) : ((x) > (hi) ? (hi) : (x)))
+#define CLAMP(x, lo, hi) ((x)<(lo)?(lo):((x)>(hi)?(hi):(x)))
 #endif
 
-/* ── Tarea de captura ───────────────────────────────────────── */
+static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
+                                        const adc_continuous_evt_data_t *edata,
+                                        void *user_data)
+{
+    BaseType_t high_prio_woken = pdFALSE;
+    vTaskNotifyGiveFromISR(s_task, &high_prio_woken);
+    return high_prio_woken == pdTRUE;
+}
+
 static void capture_task(void *arg)
 {
-    int16_t frame[AUDIO_FRAME_SIZE * 2];
+    const size_t raw_size = SOC_ADC_DIGI_RESULT_BYTES * 2 * AUDIO_FRAME_SIZE;
+    uint8_t *raw_buf = heap_caps_malloc(raw_size, MALLOC_CAP_DMA);
+    assert(raw_buf);
 
-    // Periodo en ticks — cuánto tarda un frame completo
-    const TickType_t frame_ticks = pdMS_TO_TICKS(
-        (AUDIO_FRAME_SIZE * 1000) / AUDIO_SAMPLE_RATE
-    );  // 512 muestras a 44100 Hz ≈ 11.6 ms → 12 ticks
+    int16_t stereo[AUDIO_FRAME_SIZE * 2];
 
-    ESP_LOGI(TAG, "Tarea captura iniciada — %d Hz, frame_ticks=%lu",
-             AUDIO_SAMPLE_RATE, (unsigned long)frame_ticks);
+    ESP_ERROR_CHECK(adc_continuous_start(s_adc_handle));
+    ESP_LOGI(TAG, "Tarea captura iniciada — %d Hz", AUDIO_SAMPLE_RATE);
 
-    TickType_t last_wake = xTaskGetTickCount();
+    uint32_t loop_count = 0;
+    uint32_t notify_count = 0;
+    uint32_t frames_sent = 0;
 
     while (s_running) {
+        loop_count++;
+        BaseType_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+        if (notified) notify_count++;
 
-        for (int i = 0; i < AUDIO_FRAME_SIZE; i++) {
-            int raw_l = 0, raw_r = 0;
-            int tmp;
-
-            for (int k = 0; k < AUDIO_OVERSAMPLE; k++) {
-                adc_oneshot_read(s_adc_handle, AUDIO_ADC_LEFT_CH,  &tmp);
-                raw_l += tmp;
-                adc_oneshot_read(s_adc_handle, AUDIO_ADC_RIGHT_CH, &tmp);
-                raw_r += tmp;
-            }
-            raw_l /= AUDIO_OVERSAMPLE;
-            raw_r /= AUDIO_OVERSAMPLE;
-
-            int32_t s_l = ((int32_t)raw_l - 2048) * 16;
-            int32_t s_r = ((int32_t)raw_r - 2048) * 16;
-
-            frame[i * 2]     = (int16_t) CLAMP(s_l, -32768, 32767);
-            frame[i * 2 + 1] = (int16_t) CLAMP(s_r, -32768, 32767);
+        // LOG TEMPORAL cada 100 iteraciones
+        if (loop_count % 100 == 0) {
+            ESP_LOGI(TAG, "loops=%lu notificaciones=%lu frames_enviados=%lu",
+                     (unsigned long)loop_count,
+                     (unsigned long)notify_count,
+                     (unsigned long)frames_sent);
         }
 
-        xRingbufferSend(g_audio_ringbuf,
-                        frame,
-                        sizeof(frame),
-                        pdMS_TO_TICKS(5));
+        uint32_t bytes_read = 0;
+        if (adc_continuous_read(s_adc_handle, raw_buf, raw_size,
+                                &bytes_read, 0) != ESP_OK || bytes_read == 0) continue;
 
-        // Cede al scheduler y mantiene el periodo correcto
-        vTaskDelayUntil(&last_wake, frame_ticks);
+        uint32_t n      = bytes_read / SOC_ADC_DIGI_RESULT_BYTES;
+        uint32_t frames = 0;
+
+        for (uint32_t i = 0; i + 1 < n && frames < (uint32_t)AUDIO_FRAME_SIZE; i += 2) {
+            adc_digi_output_data_t *d0 =
+                (adc_digi_output_data_t *)&raw_buf[i       * SOC_ADC_DIGI_RESULT_BYTES];
+            adc_digi_output_data_t *d1 =
+                (adc_digi_output_data_t *)&raw_buf[(i + 1) * SOC_ADC_DIGI_RESULT_BYTES];
+
+            if (d0->type1.channel != ADC_CHANNEL_7 ||
+                d1->type1.channel != ADC_CHANNEL_6) continue;
+
+            int32_t l = ((int32_t)d1->type1.data - 2048) * 16; // L viene en d1
+            int32_t r = ((int32_t)d0->type1.data - 2048) * 16; // R viene en d0
+
+            stereo[frames * 2]     = (int16_t) CLAMP(l, -32768, 32767);
+            stereo[frames * 2 + 1] = (int16_t) CLAMP(r, -32768, 32767);
+            frames++;
+        }
+
+        if (frames > 0) {
+            size_t free_space = xRingbufferGetCurFreeSize(g_audio_ringbuf);
+            size_t needed     = frames * 2 * sizeof(int16_t);
+            if (free_space < needed) {
+                size_t drain_size;
+                void *old = xRingbufferReceiveUpTo(g_audio_ringbuf, &drain_size, 0, needed - free_space);
+                if (old) vRingbufferReturnItem(g_audio_ringbuf, old);
+            }
+            xRingbufferSend(g_audio_ringbuf, stereo, needed, 0);
+            frames_sent += frames;
+        }
     }
 
-    ESP_LOGI(TAG, "Tarea captura finalizada");
+    adc_continuous_stop(s_adc_handle);
+    free(raw_buf);
     vTaskDelete(NULL);
 }
 
-/* ── API pública ────────────────────────────────────────────── */
 esp_err_t audio_capture_init(void)
 {
-    /* Ring buffer */
     g_audio_ringbuf = xRingbufferCreate(AUDIO_RINGBUF_SIZE, RINGBUF_TYPE_BYTEBUF);
-    if (!g_audio_ringbuf) {
-        ESP_LOGE(TAG, "Error creando ring buffer");
-        return ESP_ERR_NO_MEM;
-    }
+    if (!g_audio_ringbuf) return ESP_ERR_NO_MEM;
 
-    /* ADC oneshot unit */
-    adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = ADC_UNIT_1 };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &s_adc_handle));
-
-    /* Configurar canales */
-    adc_oneshot_chan_cfg_t chan_cfg = {
-        .atten    = ADC_ATTEN_DB_12,   /* 0–3.3 V */
-        .bitwidth = ADC_BITWIDTH_12,
+    adc_continuous_handle_cfg_t handle_cfg = {
+        .max_store_buf_size = AUDIO_FRAME_SIZE * 8 * SOC_ADC_DIGI_RESULT_BYTES,
+        .conv_frame_size    = AUDIO_FRAME_SIZE * 2 * SOC_ADC_DIGI_RESULT_BYTES,
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, AUDIO_ADC_LEFT_CH,  &chan_cfg));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, AUDIO_ADC_RIGHT_CH, &chan_cfg));
+    ESP_ERROR_CHECK(adc_continuous_new_handle(&handle_cfg, &s_adc_handle));
 
-    /* Calibración */
-    adc_calibration_init(ADC_UNIT_1, AUDIO_ADC_LEFT_CH,  ADC_ATTEN_DB_12, &s_cali_l);
-    adc_calibration_init(ADC_UNIT_1, AUDIO_ADC_RIGHT_CH, ADC_ATTEN_DB_12, &s_cali_r);
+    adc_digi_pattern_config_t pattern[2] = {
+        { .atten = ADC_ATTEN_DB_12, .channel = ADC_CHANNEL_6,
+          .unit = ADC_UNIT_1, .bit_width = ADC_BITWIDTH_12 },
+        { .atten = ADC_ATTEN_DB_12, .channel = ADC_CHANNEL_7,
+          .unit = ADC_UNIT_1, .bit_width = ADC_BITWIDTH_12 },
+    };
 
-    /* Arrancar tarea en core 1 (core 0 = BT stack) */
+    adc_continuous_config_t cont_cfg = {
+        // ESP32 soporta múltiplos exactos del clock interno
+        // 44100*2 no es exacto — usar 80000 (40000 por canal) como aproximación
+        // o mejor: dejar que el BT marque el ritmo y no usar frecuencia fija
+        .sample_freq_hz = 80000,   // 40000 por canal ≈ suficiente para 44100
+        .conv_mode      = ADC_CONV_SINGLE_UNIT_1,
+        .format         = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
+        .pattern_num    = 2,
+        .adc_pattern    = pattern,
+    };
+    ESP_ERROR_CHECK(adc_continuous_config(s_adc_handle, &cont_cfg));
+
+    adc_continuous_evt_cbs_t cbs = { .on_conv_done = adc_conv_done_cb };
+    ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(s_adc_handle, &cbs, NULL));
+
     s_running = true;
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        capture_task, "audio_cap",
-        4096, NULL,
-        configMAX_PRIORITIES - 2,
-        &s_capture_task, 1
-    );
-
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Error creando tarea de captura");
-        return ESP_FAIL;
-    }
-
+    xTaskCreatePinnedToCore(capture_task, "audio_cap",
+                            4096, NULL,
+                            configMAX_PRIORITIES - 2,
+                            &s_task, 1);
     return ESP_OK;
 }
 
@@ -152,7 +143,7 @@ void audio_capture_deinit(void)
 {
     s_running = false;
     vTaskDelay(pdMS_TO_TICKS(200));
-    adc_oneshot_del_unit(s_adc_handle);
+    adc_continuous_deinit(s_adc_handle);
     if (g_audio_ringbuf) {
         vRingbufferDelete(g_audio_ringbuf);
         g_audio_ringbuf = NULL;

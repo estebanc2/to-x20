@@ -77,23 +77,38 @@ static int32_t a2dp_data_cb(uint8_t *buf, int32_t len)
         return len;
     }
 
-    size_t received = 0;
-    uint8_t *data = xRingbufferReceiveUpTo(
-        g_audio_ringbuf, &received,
-        pdMS_TO_TICKS(5),
-        (size_t)len
-    );
+    // len siempre es 512 bytes = 128 frames estéreo int16
+    // Drenar el ring buffer hasta tener exactamente lo que pide BT
+    // Si hay exceso, descartar — si hay déficit, silencio
+    size_t available = 0;
+    uint8_t *data = NULL;
 
-    if (data && received > 0) {
-        memcpy(buf, data, received);
+    // Intentar obtener exactamente len bytes
+    data = xRingbufferReceiveUpTo(g_audio_ringbuf, &available,
+                                   0,  // no bloquear
+                                   (size_t)len);
+
+    if (data && available > 0) {
+        memcpy(buf, data, available);
         vRingbufferReturnItem(g_audio_ringbuf, data);
 
-        /* Rellenar resto con silencio si el buffer no tenía suficiente */
-        if ((int32_t)received < len) {
-            memset(buf + received, 0, len - received);
+        if ((int32_t)available < len)
+            memset(buf + available, 0, len - available);
+
+        // Si el ring buffer tiene demasiado acumulado, drenar el exceso
+        // para evitar latencia creciente (causa el efecto ardilla)
+        size_t excess = xRingbufferGetCurFreeSize(g_audio_ringbuf);
+        size_t total  = AUDIO_RINGBUF_SIZE;
+        size_t used   = total - excess;
+
+        if (used > (size_t)(len * 4)) {
+            // Más de 4 frames acumulados — drenar la mitad
+            size_t to_drain = used / 2;
+            size_t drained;
+            void *old = xRingbufferReceiveUpTo(g_audio_ringbuf, &drained, 0, to_drain);
+            if (old) vRingbufferReturnItem(g_audio_ringbuf, old);
         }
     } else {
-        /* Sin datos: silencio */
         memset(buf, 0, len);
     }
 

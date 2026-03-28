@@ -12,11 +12,11 @@ void app_main(void)
     ESP_LOGI(TAG, "=== ESP32 BT Audio Bridge ===");
     ESP_LOGI(TAG, "IDF version: %s", esp_get_idf_version());
 
-    /* 1. Captura ADC → ring buffer */
-    ESP_ERROR_CHECK(audio_capture_init());
-
-    /* 2. Bluetooth A2DP Source */
+    /* 1. Bluetooth A2DP Source */
     ESP_ERROR_CHECK(bt_audio_start());
+
+   /* 2. Captura ADC → ring buffer */
+    ESP_ERROR_CHECK(audio_capture_init());
 
     /* Loop de monitoreo */
     while (1) {
