@@ -58,24 +58,25 @@ static bool adc_calibration_init(adc_unit_t unit,
 /* ── Tarea de captura ───────────────────────────────────────── */
 static void capture_task(void *arg)
 {
-    /* Buffer de un frame estéreo intercalado: L,R,L,R,... */
     int16_t frame[AUDIO_FRAME_SIZE * 2];
-    const TickType_t timeout = pdMS_TO_TICKS(10);
 
-    /* Intervalo entre muestras en microsegundos */
-    const int64_t interval_us = 1000000LL / AUDIO_SAMPLE_RATE;
+    // Periodo en ticks — cuánto tarda un frame completo
+    const TickType_t frame_ticks = pdMS_TO_TICKS(
+        (AUDIO_FRAME_SIZE * 1000) / AUDIO_SAMPLE_RATE
+    );  // 512 muestras a 44100 Hz ≈ 11.6 ms → 12 ticks
 
-    ESP_LOGI(TAG, "Tarea captura iniciada — %d Hz", AUDIO_SAMPLE_RATE);
+    ESP_LOGI(TAG, "Tarea captura iniciada — %d Hz, frame_ticks=%lu",
+             AUDIO_SAMPLE_RATE, (unsigned long)frame_ticks);
+
+    TickType_t last_wake = xTaskGetTickCount();
 
     while (s_running) {
-        int64_t t0 = esp_timer_get_time();
 
         for (int i = 0; i < AUDIO_FRAME_SIZE; i++) {
             int raw_l = 0, raw_r = 0;
+            int tmp;
 
-            /* Oversampling: promedio de N lecturas */
             for (int k = 0; k < AUDIO_OVERSAMPLE; k++) {
-                int tmp;
                 adc_oneshot_read(s_adc_handle, AUDIO_ADC_LEFT_CH,  &tmp);
                 raw_l += tmp;
                 adc_oneshot_read(s_adc_handle, AUDIO_ADC_RIGHT_CH, &tmp);
@@ -84,7 +85,6 @@ static void capture_task(void *arg)
             raw_l /= AUDIO_OVERSAMPLE;
             raw_r /= AUDIO_OVERSAMPLE;
 
-            /* Centrar y escalar a int16 */
             int32_t s_l = ((int32_t)raw_l - 2048) * 16;
             int32_t s_r = ((int32_t)raw_r - 2048) * 16;
 
@@ -92,24 +92,13 @@ static void capture_task(void *arg)
             frame[i * 2 + 1] = (int16_t) CLAMP(s_r, -32768, 32767);
         }
 
-        /* Enviar al ring buffer — descarta si lleno */
         xRingbufferSend(g_audio_ringbuf,
                         frame,
                         sizeof(frame),
-                        timeout);
+                        pdMS_TO_TICKS(5));
 
-        /* Control de timing */
-        int64_t elapsed = esp_timer_get_time() - t0;
-        int64_t sleep   = (interval_us * AUDIO_FRAME_SIZE) - elapsed;
-        if (sleep > 0) esp_rom_delay_us((uint32_t)sleep);
-    }
-    static int log_count = 0;
-    if (++log_count >= 100) {
-        log_count = 0;
-        int raw_l, raw_r;
-        adc_oneshot_read(s_adc_handle, AUDIO_ADC_LEFT_CH, &raw_l);
-        adc_oneshot_read(s_adc_handle, AUDIO_ADC_RIGHT_CH, &raw_r);
-        ESP_LOGI("ADC", "L=%d R=%d", raw_l, raw_r);
+        // Cede al scheduler y mantiene el periodo correcto
+        vTaskDelayUntil(&last_wake, frame_ticks);
     }
 
     ESP_LOGI(TAG, "Tarea captura finalizada");
