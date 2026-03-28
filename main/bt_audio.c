@@ -33,6 +33,7 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                     param->conn_stat.remote_bda[4], param->conn_stat.remote_bda[5]);
             memcpy(s_peer_addr, param->conn_stat.remote_bda, sizeof(esp_bd_addr_t));
             s_connected = true;
+            esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
         } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             ESP_LOGW(TAG, "A2DP desconectado — volviendo a discovery");
             s_connected = false;
@@ -51,6 +52,17 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         /* El sink nos informa de la config SBC negociada */
         ESP_LOGI(TAG, "Config SBC negociada");
         break;
+
+    case ESP_A2D_MEDIA_CTRL_ACK_EVT:
+        if (param->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY &&
+            param->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
+            ESP_LOGI(TAG, "Source listo — iniciando stream");
+            esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+        } else if (param->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_START &&
+                param->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
+            ESP_LOGI(TAG, "Stream iniciado correctamente");
+        }
+        break;      
 
     default:
         break;

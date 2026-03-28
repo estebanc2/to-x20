@@ -103,6 +103,14 @@ static void capture_task(void *arg)
         int64_t sleep   = (interval_us * AUDIO_FRAME_SIZE) - elapsed;
         if (sleep > 0) esp_rom_delay_us((uint32_t)sleep);
     }
+    static int log_count = 0;
+    if (++log_count >= 100) {
+        log_count = 0;
+        int raw_l, raw_r;
+        adc_oneshot_read(s_adc_handle, AUDIO_ADC_LEFT_CH, &raw_l);
+        adc_oneshot_read(s_adc_handle, AUDIO_ADC_RIGHT_CH, &raw_r);
+        ESP_LOGI("ADC", "L=%d R=%d", raw_l, raw_r);
+    }
 
     ESP_LOGI(TAG, "Tarea captura finalizada");
     vTaskDelete(NULL);
