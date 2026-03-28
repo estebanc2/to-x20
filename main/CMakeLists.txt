@@ -12,4 +12,5 @@ idf_component_register(
         freertos
         log
         nvs_flash
+        esp_ringbuf
 )
