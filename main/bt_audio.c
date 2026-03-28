@@ -87,20 +87,22 @@ static int32_t a2dp_data_cb(uint8_t *buf, int32_t len)
         return len;
     }
 
-    int out_frames = len / 4;  // frames estéreo int16 que pide BT
+    static uint32_t phase = 0;
+    const uint32_t  phase_inc = (uint32_t)(((uint64_t)RESAMPLE_IN_RATE << 16) / RESAMPLE_OUT_RATE);
 
-    // Cuántos frames del ADC necesitamos para producir out_frames a 44100 Hz
-    int in_frames_needed = (int)((int64_t)out_frames * RESAMPLE_IN_RATE / RESAMPLE_OUT_RATE) + 2;
-    int in_bytes_needed  = in_frames_needed * 4;
+    int      out_frames      = len / 4;
+    int      in_frames_need  = (int)(((uint64_t)(out_frames + 4) * RESAMPLE_IN_RATE) / RESAMPLE_OUT_RATE) + 4;
+    int      in_bytes_need   = in_frames_need * 4;
 
-    // Leer del ring buffer
-    size_t received = 0;
+    size_t   received = 0;
     uint8_t *raw = xRingbufferReceiveUpTo(g_audio_ringbuf, &received,
                                            pdMS_TO_TICKS(5),
-                                           (size_t)in_bytes_needed);
-    if (!raw || received < 4) {
+                                           (size_t)in_bytes_need);
+
+    if (!raw || received < 8) {
         if (raw) vRingbufferReturnItem(g_audio_ringbuf, raw);
         memset(buf, 0, len);
+        phase = 0;  // reset fase al perder datos — evita glitch al retomar
         return len;
     }
 
@@ -108,37 +110,35 @@ static int32_t a2dp_data_cb(uint8_t *buf, int32_t len)
     int16_t *out = (int16_t *)buf;
     int in_frames_got = (int)(received / 4);
 
-    // Resampleo lineal
-    // Acumulador de fase en punto fijo (16 bits fraccionarios)
-    static uint32_t phase = 0;  // posición fraccionaria en el buffer de entrada
-    const uint32_t phase_inc = (uint32_t)(((uint64_t)RESAMPLE_IN_RATE << 16) / RESAMPLE_OUT_RATE);
-
     for (int i = 0; i < out_frames; i++) {
         uint32_t idx  = phase >> 16;
         uint32_t frac = phase & 0xFFFF;
 
         if ((int)idx + 1 >= in_frames_got) {
-            // Sin datos suficientes — silencio para el resto
+            // Rellenar con la última muestra válida en lugar de silencio
+            // evita el click/glitch al final del buffer
+            int last = in_frames_got - 1;
+            if (last < 0) last = 0;
             for (int j = i; j < out_frames; j++) {
-                out[j * 2]     = 0;
-                out[j * 2 + 1] = 0;
+                out[j * 2]     = in[last * 2];
+                out[j * 2 + 1] = in[last * 2 + 1];
             }
+            phase = 0;
             break;
         }
 
-        // Interpolación lineal entre muestra idx e idx+1
+        // Interpolación lineal
         int32_t l0 = in[idx * 2],     l1 = in[(idx + 1) * 2];
         int32_t r0 = in[idx * 2 + 1], r1 = in[(idx + 1) * 2 + 1];
 
-        out[i * 2]     = (int16_t)(l0 + (int32_t)((l1 - l0) * frac >> 16));
-        out[i * 2 + 1] = (int16_t)(r0 + (int32_t)((r1 - r0) * frac >> 16));
+        out[i * 2]     = (int16_t)(l0 + ((l1 - l0) * (int32_t)frac >> 16));
+        out[i * 2 + 1] = (int16_t)(r0 + ((r1 - r0) * (int32_t)frac >> 16));
 
         phase += phase_inc;
     }
 
-    // Resetear phase para el próximo callback (relativa al buffer consumido)
-    uint32_t consumed_idx = phase >> 16;
-    phase -= (consumed_idx << 16);  // guardar solo la fracción restante
+    // Conservar solo la fracción — el índice entero ya fue consumido
+    phase &= 0xFFFF;
 
     vRingbufferReturnItem(g_audio_ringbuf, raw);
     return len;

@@ -71,13 +71,13 @@ static void capture_task(void *arg)
 
             int32_t raw_l = (int32_t)d1->type1.data - 2048;
             int32_t raw_r = (int32_t)d0->type1.data - 2048;
-
+            /*
             static uint32_t noise_log = 0;
             if (++noise_log <= 500) {
                 if (noise_log % 100 == 0) {
                     ESP_LOGI(TAG, "raw_l=%ld raw_r=%ld", (long)raw_l, (long)raw_r);
                 }
-            }
+            } */
 
             // Noise gate
             if (raw_l > -NOISE_GATE && raw_l < NOISE_GATE) raw_l = 0;
