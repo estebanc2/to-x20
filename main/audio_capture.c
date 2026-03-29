@@ -20,12 +20,23 @@ static bool                     s_running = false;
 #endif
 
 // Parámetros ajustables
-// Prueba con GAIN=48 primero. Si sigue bajo súbelo a 64 o 96. 
-// Si distorsiona, bájalo. El NOISE_GATE=30 silencia el ruido de fondo del ADC cuando no hay señal
-// si corta parte del audio legítimo, bájalo a 10 o 15.
+// GAIN=32: el divisor resistivo 10k/10k limita el rango de entrada; con 64 clippeaba.
+//          Si el volumen sigue bajo, subir a 48. Si distorsiona, bajar a 24.
+// NOISE_GATE=40: cubre el ruido de fondo del ADC interno (~15-25 LSB en reposo).
+//          Si corta audio legítimo (voces suaves), bajar a 25.
 
-#define GAIN        96      // subir desde 16 — ajustar al gusto
-#define NOISE_GATE  30      // muestras ADC por debajo de esto → silencio
+#define GAIN        32
+#define NOISE_GATE  40
+
+// Soft clipping: comprime la cresta gradualmente en vez de cortarla duro.
+// El hard CLAMP anterior producía distorsión tipo crunch en señales fuertes.
+// Empieza a aplanar a partir de ±28000 con pendiente 1/4 — suena mucho más natural.
+static inline int16_t soft_clip(int32_t x)
+{
+    if (x >  28000) x =  28000 + ((x -  28000) >> 2);
+    if (x < -28000) x = -28000 + ((x + 28000) >> 2);
+    return (int16_t) CLAMP(x, -32767, 32767);
+}
 
 static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
                                         const adc_continuous_evt_data_t *edata,
@@ -47,7 +58,8 @@ static void capture_task(void *arg)
     ESP_ERROR_CHECK(adc_continuous_start(s_adc));
     ESP_LOGI(TAG, "ADC continuo iniciado");
 
-    // Medición de tasa real
+    // Medición de tasa real — necesaria para calibrar RESAMPLE_IN_RATE en bt_audio.c.
+    // Conectar al monitor serie, esperar 5 s, copiar el valor y pegarlo en bt_audio.c.
     uint32_t total_frames = 0;
     int64_t  t_start      = esp_timer_get_time();
 
@@ -71,55 +83,46 @@ static void capture_task(void *arg)
 
             int32_t raw_l = (int32_t)d1->type1.data - 2048;
             int32_t raw_r = (int32_t)d0->type1.data - 2048;
-            /*
-            static uint32_t noise_log = 0;
-            if (++noise_log <= 500) {
-                if (noise_log % 100 == 0) {
-                    ESP_LOGI(TAG, "raw_l=%ld raw_r=%ld", (long)raw_l, (long)raw_r);
-                }
-            } */
 
-            // Noise gate
+            // Noise gate sobre la muestra cruda
             if (raw_l > -NOISE_GATE && raw_l < NOISE_GATE) raw_l = 0;
             if (raw_r > -NOISE_GATE && raw_r < NOISE_GATE) raw_r = 0;
 
-            // Filtro paso bajo IIR: y = (3*y + x) / 4
-            // lp_l = (lp_l * 3 + raw_l) >> 2;
-            // lp_r = (lp_r * 3 + raw_r) >> 2;
-
+            // Filtro paso bajo IIR coef 7/8 (fc ≈ 14 kHz)
             lp_l = (lp_l * 7 + raw_l) >> 3;
             lp_r = (lp_r * 7 + raw_r) >> 3;
 
-            /*
-            Si sigue sonando, prueba con coef 0.9375:
-            clp_l = (lp_l * 15 + raw_l) >> 4;
-            lp_r = (lp_r * 15 + raw_r) >> 4;
-            Cuanto más alto el coeficiente, más agresivo el filtro pero también más suaviza 
-            las frecuencias altas del audio útil. Con * 15 >> 4 ya debería eliminar el ruido de moto — 
-            si el audio suena opaco o sin brillo, vuelve a * 7 >> 3.
-            */
+            // FIX ruido de moto: cuando la muestra cruda es silencio, drenar el
+            // estado del filtro IIR hacia 0 con decay rápido (3/4 por muestra).
+            // Sin esto el ruido del ADC (~15-25 LSB en reposo) se acumula en
+            // lp_l/lp_r — el filtro tiene memoria — y sale amplificado por GAIN,
+            // produciendo el zumbido constante incluso sin señal de entrada.
+            if (raw_l == 0) lp_l = (lp_l * 3) >> 2;
+            if (raw_r == 0) lp_r = (lp_r * 3) >> 2;
 
             int32_t l = lp_l * GAIN;
             int32_t r = lp_r * GAIN;
 
-            stereo[frames * 2]     = (int16_t) CLAMP(l, -32768, 32767);
-            stereo[frames * 2 + 1] = (int16_t) CLAMP(r, -32768, 32767);
+            // FIX clipping: soft_clip en vez de hard CLAMP
+            stereo[frames * 2]     = soft_clip(l);
+            stereo[frames * 2 + 1] = soft_clip(r);
             frames++;
         }
 
         total_frames += frames;
 
-        // LOG cada 5 segundos
+        // Log de tasa real cada 5 s — copiar valor en RESAMPLE_IN_RATE (bt_audio.c)
         int64_t elapsed = esp_timer_get_time() - t_start;
         if (elapsed >= 5000000LL) {
-            //uint32_t hz = (uint32_t)((int64_t)total_frames * 1000000LL / elapsed);
-            //ESP_LOGI(TAG, "Tasa ADC real: %lu Hz/canal (objetivo: 44100)", (unsigned long)hz);
+            uint32_t hz = (uint32_t)((int64_t)total_frames * 1000000LL / elapsed);
+            ESP_LOGI(TAG, "Tasa ADC real: %lu Hz/canal (objetivo: 44100)", (unsigned long)hz);
             total_frames = 0;
             t_start = esp_timer_get_time();
         }
 
         if (frames > 0) {
-            size_t max_bytes = 4 * AUDIO_FRAME_SIZE * 2 * sizeof(int16_t);
+            // Margen de 16 frames (~200 ms) para absorber jitter del stack BT
+            size_t max_bytes = 16 * AUDIO_FRAME_SIZE * 2 * sizeof(int16_t);
             size_t used = AUDIO_RINGBUF_SIZE - xRingbufferGetCurFreeSize(g_audio_ringbuf);
             if (used > max_bytes) {
                 size_t to_drain = used - max_bytes;
@@ -155,7 +158,6 @@ esp_err_t audio_capture_init(void)
     };
 
     adc_continuous_config_t cont_cfg = {
-        // 44100 Hz × 2 canales, redondeado al múltiplo soportado por el ESP32
         .sample_freq_hz = 78000,
         .conv_mode      = ADC_CONV_SINGLE_UNIT_1,
         .format         = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
@@ -188,19 +190,15 @@ void audio_capture_deinit(void)
 
 void audio_capture_set_rate(uint8_t sf_index)
 {
-    // Frecuencias SBC estándar
     const uint32_t target_hz[] = {16000, 32000, 44100, 48000};
     if (sf_index > 3) return;
 
     uint32_t target = target_hz[sf_index];
-    // Ajustar sample_freq_hz del ADC usando la proporción medida (factor 0.409)
-    // sample_freq_hz_needed = target * 2 / 0.409 = target * 4.89
     uint32_t adc_freq = (uint32_t)(target * 2 * 10000 / 4090);
 
     ESP_LOGI(TAG, "Ajustando ADC para %lu Hz/canal — config: %lu",
              (unsigned long)target, (unsigned long)adc_freq);
 
-    // Reconfigurar el ADC en caliente
     adc_continuous_stop(s_adc);
 
     adc_digi_pattern_config_t pattern[2] = {

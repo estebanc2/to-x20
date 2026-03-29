@@ -47,17 +47,16 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                  ? "STARTED" : "STOPPED");
         break;
 
-    case ESP_A2D_AUDIO_CFG_EVT: 
+    case ESP_A2D_AUDIO_CFG_EVT: {
         uint8_t *sbc = (uint8_t *)&param->audio_cfg.mcc.cie;
         uint8_t sf = sbc[0] >> 6;
         const char *freq_str[] = {"16k", "32k", "44.1k", "48k"};
         ESP_LOGI(TAG, "SBC negociado — frecuencia: %s",
                 sf < 4 ? freq_str[sf] : "?");
-        // sf==0→16k, sf==1→32k, sf==2→44.1k, sf==3→48k
-        // Guardamos para ajustar el ADC
         extern void audio_capture_set_rate(uint8_t sf_index);
         audio_capture_set_rate(sf);
         break;
+    }
 
     case ESP_A2D_MEDIA_CTRL_ACK_EVT:
         if (param->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY &&
@@ -68,16 +67,20 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                 param->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
             ESP_LOGI(TAG, "Stream iniciado correctamente");
         }
-        break;      
+        break;
 
     default:
         break;
     }
 }
-// Ratio de resampleo: cuántas muestras ADC por cada muestra BT
-// ADC produce ~31909 Hz, BT espera 44100 Hz
-// ratio = 31909 / 44100 = 0.7235 — por cada muestra BT tomamos 0.7235 del ADC
-#define RESAMPLE_IN_RATE   31909
+
+// FIX 3: Calibrar RESAMPLE_IN_RATE con el valor real de tu chip.
+// 1. Flashear con el log de tasa real descomentado en audio_capture.c
+// 2. Conectar al monitor serie (idf.py monitor)
+// 3. Esperar 5 segundos y copiar el valor "Tasa ADC real: XXXXX Hz/canal"
+// 4. Reemplazar 31909 abajo con ese valor y reflashear.
+// Un error de ~500 Hz (~1.5%) hace que el audio suene ligeramente acelerado o frenado.
+#define RESAMPLE_IN_RATE   31910   // ← reemplazar con valor medido del log
 #define RESAMPLE_OUT_RATE  44100
 
 static int32_t a2dp_data_cb(uint8_t *buf, int32_t len)
@@ -87,12 +90,26 @@ static int32_t a2dp_data_cb(uint8_t *buf, int32_t len)
         return len;
     }
 
+    // FIX 2: phase acumula correctamente entre callbacks.
+    //
+    // Bug original: al final del callback se hacía "phase &= 0xFFFF", lo que
+    // conservaba solo la fracción sub-sample pero descartaba silenciosamente los
+    // índices enteros consumidos. El próximo callback arrancaba con phase=fracción,
+    // es decir desde el frame 0 del nuevo buffer, ignorando que ya había avanzado
+    // parcialmente. Esto introducía micro-discontinuidades periódicas (glitches,
+    // pequeños clicks) cada vez que el callback se completaba normalmente.
+    //
+    // Fix: se trackea el último índice entero consumido (last_idx) y al salir del
+    // loop se sustrae esa parte entera de phase, conservando solo la fracción real.
+    // phase representa ahora cuánto del primer frame del próximo buffer ya fue
+    // "pre-consumido" en el callback anterior — es la forma correcta de mantener
+    // la continuidad del resampleo entre llamadas.
     static uint32_t phase = 0;
     const uint32_t  phase_inc = (uint32_t)(((uint64_t)RESAMPLE_IN_RATE << 16) / RESAMPLE_OUT_RATE);
 
-    int      out_frames      = len / 4;
-    int      in_frames_need  = (int)(((uint64_t)(out_frames + 4) * RESAMPLE_IN_RATE) / RESAMPLE_OUT_RATE) + 4;
-    int      in_bytes_need   = in_frames_need * 4;
+    int out_frames     = len / 4;
+    int in_frames_need = (int)(((uint64_t)(out_frames + 4) * RESAMPLE_IN_RATE) / RESAMPLE_OUT_RATE) + 4;
+    int in_bytes_need  = in_frames_need * 4;
 
     size_t   received = 0;
     uint8_t *raw = xRingbufferReceiveUpTo(g_audio_ringbuf, &received,
@@ -102,7 +119,7 @@ static int32_t a2dp_data_cb(uint8_t *buf, int32_t len)
     if (!raw || received < 8) {
         if (raw) vRingbufferReturnItem(g_audio_ringbuf, raw);
         memset(buf, 0, len);
-        phase = 0;  // reset fase al perder datos — evita glitch al retomar
+        phase = 0;
         return len;
     }
 
@@ -110,36 +127,42 @@ static int32_t a2dp_data_cb(uint8_t *buf, int32_t len)
     int16_t *out = (int16_t *)buf;
     int in_frames_got = (int)(received / 4);
 
+    int last_idx = 0;  // último índice entero consumido en este callback
+
     for (int i = 0; i < out_frames; i++) {
         uint32_t idx  = phase >> 16;
         uint32_t frac = phase & 0xFFFF;
 
         if ((int)idx + 1 >= in_frames_got) {
-            // Rellenar con la última muestra válida en lugar de silencio
-            // evita el click/glitch al final del buffer
+            // Fin del buffer de entrada: rellenar con la última muestra válida
             int last = in_frames_got - 1;
             if (last < 0) last = 0;
             for (int j = i; j < out_frames; j++) {
                 out[j * 2]     = in[last * 2];
                 out[j * 2 + 1] = in[last * 2 + 1];
             }
-            phase = 0;
-            break;
+            last_idx = last;
+            // Conservar solo fracción — el próximo buffer empieza desde 0
+            phase = frac;
+            goto done;
         }
 
-        // Interpolación lineal
+        // Interpolación lineal entre frame idx y idx+1
         int32_t l0 = in[idx * 2],     l1 = in[(idx + 1) * 2];
         int32_t r0 = in[idx * 2 + 1], r1 = in[(idx + 1) * 2 + 1];
 
         out[i * 2]     = (int16_t)(l0 + ((l1 - l0) * (int32_t)frac >> 16));
         out[i * 2 + 1] = (int16_t)(r0 + ((r1 - r0) * (int32_t)frac >> 16));
 
+        last_idx = (int)idx;
         phase += phase_inc;
     }
 
-    // Conservar solo la fracción — el índice entero ya fue consumido
-    phase &= 0xFFFF;
+    // FIX 2: restar la parte entera consumida, conservar solo la fracción.
+    // Sin este fix phase &= 0xFFFF descartaba los índices y causaba glitches.
+    phase -= ((uint32_t)last_idx << 16);
 
+done:
     vRingbufferReturnItem(g_audio_ringbuf, raw);
     return len;
 }
@@ -148,7 +171,6 @@ static int32_t a2dp_data_cb(uint8_t *buf, int32_t len)
 static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 {
     if (event == ESP_BT_GAP_DISC_RES_EVT) {
-        /* Intentar conectar con cualquier dispositivo que encuentre */
         ESP_LOGI(TAG, "Dispositivo encontrado — intentando A2DP...");
         esp_a2d_source_connect(param->disc_res.bda);
     }
@@ -157,7 +179,6 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 /* ── API pública ────────────────────────────────────────────── */
 esp_err_t bt_audio_start(void)
 {
-    /* NVS requerido por BT */
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
         err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -165,7 +186,6 @@ esp_err_t bt_audio_start(void)
         nvs_flash_init();
     }
 
-    /* Liberar memoria BLE (no la usamos) */
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
 
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
@@ -174,19 +194,15 @@ esp_err_t bt_audio_start(void)
     ESP_ERROR_CHECK(esp_bluedroid_init());
     ESP_ERROR_CHECK(esp_bluedroid_enable());
 
-    /* Nombre visible */
     esp_bt_gap_set_device_name(BT_DEVICE_NAME);
-    
-    /* Registrar callbacks */
+
     ESP_ERROR_CHECK(esp_bt_gap_register_callback(gap_cb));
     ESP_ERROR_CHECK(esp_a2d_register_callback(a2dp_cb));
     ESP_ERROR_CHECK(esp_a2d_source_register_data_callback(a2dp_data_cb));
     ESP_ERROR_CHECK(esp_a2d_source_init());
 
-    /* Hacer el dispositivo descubrible/conectable */
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 
-    /* Iniciar búsqueda de auriculares */
     ESP_LOGI(TAG, "Iniciando discovery — pon auriculares en modo pairing");
     esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
 
