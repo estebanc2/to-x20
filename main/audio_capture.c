@@ -20,17 +20,16 @@ static bool                     s_running = false;
 #endif
 
 // Parámetros ajustables
-// GAIN=32: el divisor resistivo 10k/10k limita el rango de entrada; con 64 clippeaba.
-//          Si el volumen sigue bajo, subir a 48. Si distorsiona, bajar a 24.
-// NOISE_GATE=40: cubre el ruido de fondo del ADC interno (~15-25 LSB en reposo).
-//          Si corta audio legítimo (voces suaves), bajar a 25.
+// GAIN=32: con divisor 10k/10k el rango de entrada es limitado.
+//          Subir a 48 si el volumen es bajo. Bajar a 24 si distorsiona.
+// NOISE_GATE=40: cubre el ruido de fondo del ADC (~15-25 LSB en reposo).
+//          Bajar a 25 si corta voces suaves.
 
 #define GAIN        32
 #define NOISE_GATE  40
 
-// Soft clipping: comprime la cresta gradualmente en vez de cortarla duro.
-// El hard CLAMP anterior producía distorsión tipo crunch en señales fuertes.
-// Empieza a aplanar a partir de ±28000 con pendiente 1/4 — suena mucho más natural.
+// Soft clipping: aplana la cresta gradualmente en vez de cortarla duro.
+// Evita el crunch/distorsión en señales fuertes.
 static inline int16_t soft_clip(int32_t x)
 {
     if (x >  28000) x =  28000 + ((x -  28000) >> 2);
@@ -53,13 +52,12 @@ static void capture_task(void *arg)
     uint8_t *raw_buf = heap_caps_malloc(raw_size, MALLOC_CAP_DMA);
     assert(raw_buf);
 
+    // Output mono: mismo valor en L y R
     int16_t stereo[AUDIO_FRAME_SIZE * 2];
 
     ESP_ERROR_CHECK(adc_continuous_start(s_adc));
-    ESP_LOGI(TAG, "ADC continuo iniciado");
+    ESP_LOGI(TAG, "ADC continuo iniciado — modo MONO con oversampling x2");
 
-    // Medición de tasa real — necesaria para calibrar RESAMPLE_IN_RATE en bt_audio.c.
-    // Conectar al monitor serie, esperar 5 s, copiar el valor y pegarlo en bt_audio.c.
     uint32_t total_frames = 0;
     int64_t  t_start      = esp_timer_get_time();
 
@@ -73,7 +71,7 @@ static void capture_task(void *arg)
         uint32_t n = bytes_read / SOC_ADC_DIGI_RESULT_BYTES;
         uint32_t frames = 0;
 
-        static int32_t lp_l = 0, lp_r = 0;
+        static int32_t lp = 0;   // filtro IIR único para el canal mono
 
         for (uint32_t i = 0; i + 1 < n && frames < (uint32_t)AUDIO_FRAME_SIZE; i += 2) {
             adc_digi_output_data_t *d0 =
@@ -81,37 +79,38 @@ static void capture_task(void *arg)
             adc_digi_output_data_t *d1 =
                 (adc_digi_output_data_t *)&raw_buf[(i + 1) * SOC_ADC_DIGI_RESULT_BYTES];
 
+            // Oversampling x2 + mezcla estéreo→mono:
+            // d0 = CH7 (R), d1 = CH6 (L) — el hardware entrega en orden invertido.
+            // Promediamos las dos muestras simultáneas: reduce el ruido de
+            // cuantización del ADC interno ~3 dB porque el ruido de cada canal
+            // es no correlacionado, mientras que la señal (misma fuente) se suma.
             int32_t raw_l = (int32_t)d1->type1.data - 2048;
             int32_t raw_r = (int32_t)d0->type1.data - 2048;
+            int32_t raw   = (raw_l + raw_r) >> 1;   // promedio L+R → mono
 
-            // Noise gate sobre la muestra cruda
-            if (raw_l > -NOISE_GATE && raw_l < NOISE_GATE) raw_l = 0;
-            if (raw_r > -NOISE_GATE && raw_r < NOISE_GATE) raw_r = 0;
+            // Noise gate sobre la muestra promediada
+            if (raw > -NOISE_GATE && raw < NOISE_GATE) raw = 0;
 
             // Filtro paso bajo IIR coef 7/8 (fc ≈ 14 kHz)
-            lp_l = (lp_l * 7 + raw_l) >> 3;
-            lp_r = (lp_r * 7 + raw_r) >> 3;
+            lp = (lp * 7 + raw) >> 3;
 
-            // FIX ruido de moto: cuando la muestra cruda es silencio, drenar el
-            // estado del filtro IIR hacia 0 con decay rápido (3/4 por muestra).
-            // Sin esto el ruido del ADC (~15-25 LSB en reposo) se acumula en
-            // lp_l/lp_r — el filtro tiene memoria — y sale amplificado por GAIN,
-            // produciendo el zumbido constante incluso sin señal de entrada.
-            if (raw_l == 0) lp_l = (lp_l * 3) >> 2;
-            if (raw_r == 0) lp_r = (lp_r * 3) >> 2;
+            // Decay rápido del estado del filtro en silencio.
+            // Evita que el ruido del ADC se acumule en lp y salga
+            // amplificado como ruido de moto cuando no hay señal.
+            if (raw == 0) lp >>= 1;
 
-            int32_t l = lp_l * GAIN;
-            int32_t r = lp_r * GAIN;
+            int32_t mono = lp * GAIN;
+            int16_t s    = soft_clip(mono);
 
-            // FIX clipping: soft_clip en vez de hard CLAMP
-            stereo[frames * 2]     = soft_clip(l);
-            stereo[frames * 2 + 1] = soft_clip(r);
+            // Mismo valor mono en L y R
+            stereo[frames * 2]     = s;
+            stereo[frames * 2 + 1] = s;
             frames++;
         }
 
         total_frames += frames;
 
-        // Log de tasa real cada 5 s — copiar valor en RESAMPLE_IN_RATE (bt_audio.c)
+        // Log tasa real cada 5 s — copiar el valor en RESAMPLE_IN_RATE (bt_audio.c)
         int64_t elapsed = esp_timer_get_time() - t_start;
         if (elapsed >= 5000000LL) {
             uint32_t hz = (uint32_t)((int64_t)total_frames * 1000000LL / elapsed);
@@ -150,6 +149,9 @@ esp_err_t audio_capture_init(void)
     };
     ESP_ERROR_CHECK(adc_continuous_new_handle(&handle_cfg, &s_adc));
 
+    // Ambos canales siguen configurados — CH6 (L) y CH7 (R) —
+    // pero ahora se usan como dos muestras simultáneas para oversampling,
+    // no como canales estéreo independientes.
     adc_digi_pattern_config_t pattern[2] = {
         { .atten = ADC_ATTEN_DB_12, .channel = ADC_CHANNEL_6,
           .unit = ADC_UNIT_1, .bit_width = ADC_BITWIDTH_12 },
